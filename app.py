@@ -2133,6 +2133,46 @@ footer a:hover { color: var(--gold); }
   text-align: center;
 }
 
+/* Member quick access bar */
+.member-bar {
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 72px;
+  z-index: 45;
+}
+.member-bar .wrap {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+.member-bar .wrap::-webkit-scrollbar { display: none; }
+.member-bar-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--gold);
+  flex-shrink: 0;
+}
+.member-bar a {
+  font-size: 14px;
+  color: var(--ink-dim);
+  flex-shrink: 0;
+  transition: color 0.15s ease;
+}
+.member-bar a:hover { color: var(--gold); }
+
+@media (max-width: 860px) {
+  .member-bar { top: 0; position: relative; }
+  .member-bar .wrap { gap: 18px; }
+}
+
 /* Floating support button */
 .support-float {
   position: fixed;
@@ -2183,6 +2223,30 @@ def base_layout(title: str, content: str, active: str = "") -> str:
     def nav_class(key):
         return "active" if key == active else ""
 
+    try:
+        logged_in = bool(session.get("member_id"))
+    except Exception:
+        logged_in = False
+
+    if logged_in:
+        nav_cta = '<a href="/account" class="nav-cta">My Account</a>'
+        member_bar = """
+<div class="member-bar">
+  <div class="wrap">
+    <span class="member-bar-label">Your access</span>
+    <a href="/account">My Account</a>
+    <a href="/education/fundamentals/0">Fundamentals</a>
+    <a href="/education/fundamentals/contents">All Lessons</a>
+    <a href="/education/advanced/0">Advanced</a>
+    <a href="/signals">Extra Signals</a>
+    <a href="/community">Community</a>
+  </div>
+</div>
+"""
+    else:
+        nav_cta = '<a href="/unlock" class="nav-cta">Log In</a>'
+        member_bar = ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2203,9 +2267,10 @@ def base_layout(title: str, content: str, active: str = "") -> str:
       <a href="/signals">Extra Signals</a>
       <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" style="color: var(--gold);">Support</a>
     </div>
-    <a href="/onboarding" class="nav-cta">Get Started</a>
+    {nav_cta}
   </div>
 </nav>
+{member_bar}
 {content}
 <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="support-float">💬 Need help?</a>
 <div class="disclaimer-strip">
@@ -2303,10 +2368,12 @@ def admin_approve(member_id):
         tier_label = "gold signals" if member["tier"] == "gold" else "currency signals"
         msg = (
             f"You're approved! Welcome to Inner Circle.\n\n"
-            f"Your {tier_label} Telegram group: {group_link}\n\n"
-            f"Your website access code: {member['access_code']}\n"
-            f"Enter this at innercircle.com/unlock to unlock your Education access.\n\n"
-            f"Keep this code safe, you'll need it again if you ever switch devices."
+            f"Your {tier_label} Telegram group:\n{group_link}\n\n"
+            f"Your website access code: {member['access_code']}\n\n"
+            f"To unlock your Education access, go to:\n"
+            f"https://innercircletrading.co/unlock\n\n"
+            f"Enter your code there and you're in. Keep this code safe, you'll need it again if you "
+            f"switch phone or clear your browser."
         )
         if member.get("chat_id"):
             send_telegram_message(member["chat_id"], msg)
@@ -2336,25 +2403,30 @@ def unlock():
             session["member_tier"] = member["tier"]
             session["member_paid"] = member.get("paid", False)
             session["member_name"] = member.get("name", "")
-            return redirect(url_for("education_fundamentals"))
+            return redirect(url_for("account"))
         error = "That code wasn't recognised, double check it or contact us for help."
 
     content = f"""
-<section style="padding: 100px 0;">
+<section style="padding: 90px 0;">
   <div class="wrap" style="max-width: 440px;">
     <div class="form-panel">
-      <h3 style="font-size: 20px; margin-bottom: 10px;">Unlock Your Access</h3>
-      <p style="color: var(--ink-dim); font-size: 14px; margin: 0 0 20px;">Enter the access code you were sent on Telegram after approval.</p>
+      <h3 style="font-size: 22px; margin-bottom: 10px;">Log in</h3>
+      <p style="color: var(--ink-dim); font-size: 14px; margin: 0 0 20px;">Enter the access code we sent you on Telegram after your approval. It looks like AC-XXXXXXX.</p>
       <form method="POST">
         <input type="text" name="access_code" placeholder="AC-XXXXXXX" style="width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--ink); padding: 13px 16px; border-radius: 10px; text-transform: uppercase;">
-        <button type="submit" style="margin-top: 16px;">Unlock</button>
+        <button type="submit" style="margin-top: 16px;">Log In</button>
       </form>
       {f'<p style="color: var(--red); font-size: 13px; margin-top: 14px;">{error}</p>' if error else ''}
+      <p style="color: var(--ink-dim); font-size: 13px; margin-top: 20px; border-top: 1px solid var(--line); padding-top: 20px;">
+        Not got a code yet? You'll get one once your onboarding is approved.
+        <br><a href="/onboarding" class="inline-link">Start onboarding →</a>
+        <br><br>Lost your code? <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="inline-link">Message us on Telegram</a> and we'll resend it.
+      </p>
     </div>
   </div>
 </section>
 """
-    return render_template_string(base_layout("Unlock", content, ""))
+    return render_template_string(base_layout("Log In", content, ""))
 
 
 # ---------------------------------------------------------------------------
@@ -2363,6 +2435,7 @@ def unlock():
 
 # in-memory per-chat photo counter for the current verification attempt
 _photo_counts = {}
+_payment_pending = {}
 
 
 def upsert_bot_contact(username, chat_id):
@@ -2917,6 +2990,43 @@ def telegram_webhook():
         reply("Ask me anything about getting set up, deposits, MT5, the courses, or your verification code. If I can't help, I'll pass you to the team.")
         return "ok"
 
+    # Detect someone flagging an Advanced course payment
+    caption = (message.get("caption") or "").lower()
+    payment_words = ["advanced paid", "paid advanced", "paid for advanced", "payment for advanced",
+                     "advanced payment", "paid the advanced", "advanced course paid",
+                     "paid for the advanced", "proof of payment", "payment proof", "paid £99", "paid 99"]
+
+    is_payment_text = any(w in text for w in payment_words)
+    is_payment_caption = any(w in caption for w in payment_words)
+
+    if photos and (is_payment_caption or _payment_pending.get(chat_id)):
+        _payment_pending.pop(chat_id, None)
+        _photo_counts[chat_id] = 0
+        reply(
+            "Thanks, got your payment screenshot. I've sent it straight over to our admin team.\n\n"
+            "They'll review it and unlock your Advanced Chart Reading access, usually well within 24 hours. "
+            "You'll get a message here the moment it's live."
+        )
+        if username:
+            contact_line = f"From: @{username}\nReply: https://t.me/{username}"
+        else:
+            contact_line = f"From: chat ID {chat_id} (no @username set on their account)"
+        notify_admin(
+            f"💷 ADVANCED COURSE PAYMENT SCREENSHOT\n\n{contact_line}\n\n"
+            f"Caption: {message.get('caption') or '(none)'}\n\n"
+            f"Check the screenshot in your Telegram chat with them, then Mark Paid at /admin."
+        )
+        return "ok"
+
+    if is_payment_text and not photos:
+        _payment_pending[chat_id] = True
+        reply(
+            "Great, thanks for letting me know. Could you send a screenshot of your payment over here "
+            "and I'll get it straight to our admin team to review?\n\n"
+            "Once they've confirmed it, your Advanced Chart Reading access gets unlocked and I'll message you here."
+        )
+        return "ok"
+
     if photos:
         _photo_counts.setdefault(chat_id, 0)
         _photo_counts[chat_id] += 1
@@ -2952,6 +3062,75 @@ def telegram_webhook():
     return "ok"
 
 
+@app.route("/account")
+def account():
+    if not is_verified():
+        return redirect(url_for("unlock"))
+
+    name = session.get("member_name", "")
+    tier = session.get("member_tier", "gold")
+    paid = session.get("member_paid", False)
+
+    tier_label = "Gold signals" if tier == "gold" else "Currency signals"
+
+    advanced_row = (
+        '<li style="padding: 14px 0; border-bottom: 1px solid var(--line);">'
+        '<strong style="color: var(--green);">✓ Advanced Chart Reading</strong>'
+        '<br><span style="color: var(--ink-dim); font-size: 13px;">Unlocked, 23 lessons</span>'
+        '<br><a href="/education/advanced/0" class="inline-link" style="font-size: 13px;">Open course →</a></li>'
+        if paid else
+        '<li style="padding: 14px 0; border-bottom: 1px solid var(--line);">'
+        '<span style="color: var(--ink-dim);">🔒 Advanced Chart Reading</span>'
+        '<br><span style="color: var(--ink-dim); font-size: 13px;">£99 one-time, not yet unlocked</span>'
+        '<br><a href="/education/advanced/0" class="inline-link" style="font-size: 13px;">Unlock it →</a></li>'
+    )
+
+    content = f"""
+<section style="padding: 70px 0;">
+  <div class="wrap" style="max-width: 560px;">
+    <span class="eyebrow">Your account</span>
+    <h1 style="font-size: 30px; margin: 10px 0 8px;">Hi{', ' + name if name else ''}</h1>
+    <p style="color: var(--ink-dim); margin-bottom: 36px;">Here's what you've got access to.</p>
+
+    <div class="form-panel">
+      <ul style="list-style: none; padding: 0; margin: 0;">
+        <li style="padding: 14px 0; border-bottom: 1px solid var(--line);">
+          <strong style="color: var(--green);">✓ {tier_label}</strong>
+          <br><span style="color: var(--ink-dim); font-size: 13px;">Approved and active</span>
+        </li>
+        <li style="padding: 14px 0; border-bottom: 1px solid var(--line);">
+          <strong style="color: var(--green);">✓ Trading Fundamentals</strong>
+          <br><span style="color: var(--ink-dim); font-size: 13px;">Free course, 41 lessons</span>
+          <br><a href="/education/fundamentals/0" class="inline-link" style="font-size: 13px;">Open course →</a>
+        </li>
+        {advanced_row}
+        <li style="padding: 14px 0;">
+          <strong>Extra Signals</strong>
+          <br><span style="color: var(--ink-dim); font-size: 13px;">Add a second account for currency signals</span>
+          <br><a href="/signals" class="inline-link" style="font-size: 13px;">View Extra Signals →</a>
+        </li>
+      </ul>
+    </div>
+
+    <p style="color: var(--ink-dim); font-size: 13px; margin-top: 28px;">
+      Need help? Message us on <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="inline-link">Telegram</a>.
+      <br><a href="/logout" class="inline-link">Log out</a>
+    </p>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("My Account", content, ""))
+
+
+@app.route("/logout")
+def logout():
+    session.pop("member_id", None)
+    session.pop("member_tier", None)
+    session.pop("member_paid", None)
+    session.pop("member_name", None)
+    return redirect(url_for("home"))
+
+
 def is_verified():
     return bool(session.get("member_id"))
 
@@ -2968,6 +3147,9 @@ def locked_page(reason_text, cta_text, cta_url):
     <h1 style="font-size: 28px; margin-bottom: 16px;">This is locked</h1>
     <p style="color: var(--ink-dim); font-size: 16px; margin-bottom: 32px;">{reason_text}</p>
     <a href="{cta_url}" class="btn btn-primary">{cta_text}</a>
+    <p style="color: var(--ink-dim); font-size: 14px; margin-top: 28px;">
+      Already approved? <a href="/unlock" class="inline-link">Log in with your access code</a>
+    </p>
   </div>
 </section>
 """
@@ -3819,11 +4001,37 @@ def education_advanced():
 @app.route("/education/advanced/<int:idx>")
 def education_advanced_lesson(idx):
     if not is_paid():
-        return locked_page(
-            "Advanced Chart Reading is a paid course (£99, one-time). It unlocks once your payment is confirmed, "
-            "message us on Telegram to arrange payment and get unlocked.",
-            "Message Us on Telegram", "https://t.me/Innercircleverifybot"
-        )
+        content = """
+<section style="padding: 80px 0;">
+  <div class="wrap" style="max-width: 560px; text-align: center;">
+    <div class="ring-mark" style="margin: 0 auto 24px;"><span>🔒</span></div>
+    <span class="eyebrow">£99 · One-time payment</span>
+    <h1 style="font-size: 30px; margin: 12px 0 18px;">Advanced Chart Reading</h1>
+    <p style="color: var(--ink-dim); font-size: 16px; margin-bottom: 32px;">
+      23 lessons teaching you to read charts yourself, candlestick patterns, market structure,
+      support and resistance, liquidity, and building your own strategy. One payment, yours for good.
+    </p>
+
+    <a href="https://www.paypal.com/ncp/payment/JMNWH9XAF6PXL" target="_blank" rel="noopener" class="btn btn-primary" style="font-size: 16px; padding: 18px 40px;">Pay £99 &amp; Unlock</a>
+
+    <div class="form-panel" style="margin-top: 40px; text-align: left;">
+      <h3 style="font-size: 16px; margin-bottom: 12px;">What happens next</h3>
+      <ol style="color: var(--ink-dim); font-size: 14px; line-height: 1.9; padding-left: 20px; margin: 0;">
+        <li>Complete your payment through the link above.</li>
+        <li><strong>Important:</strong> use the same name as your Inner Circle account, or add your Telegram username in the notes.</li>
+        <li>Please give our admin team up to 24 hours to review your payment.</li>
+        <li>You'll get a message on Telegram once it's live, then just refresh this page.</li>
+      </ol>
+      <p style="color: var(--gold); font-size: 14px; line-height: 1.7; margin: 16px 0 0; padding-top: 16px; border-top: 1px solid var(--line);">
+        Want it sorted quicker? Message
+        <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="inline-link">our bot on Telegram</a>
+        saying <strong>"advanced paid"</strong> and send a screenshot of your payment. It goes straight to our admin team for review.
+      </p>
+    </div>
+  </div>
+</section>
+"""
+        return render_template_string(base_layout("Unlock Advanced", content, "education"))
     lessons = parse_course(ADVANCED_MD)
     return lesson_page(
         "advanced", "Advanced Chart Reading", lessons, idx,
