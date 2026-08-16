@@ -1,3 +1,5 @@
 flask
 requests
 gunicorn
+markdown
+psycopg2-binary
