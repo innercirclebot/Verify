@@ -27,7 +27,38 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GOLD_GROUP_LINK = os.environ.get("GOLD_GROUP_LINK", "https://t.me/+etxMbgmMTW1mYTlk")
-CURRENCY_GROUP_LINK = os.environ.get("CURRENCY_GROUP_LINK", "https://t.me/+your_currency_group_invite")
+CURRENCY_APPROVED_MESSAGE = """Thank you for completing your full verification for extra signals. You are now successfully registered, please use your new PU Prime account going forward to stay in all the signal groups.
+
+Below are the official links to our channels. Kindly request to join, and your access will be approved shortly:
+
+Premium Gold Group (recommended)
+Longer trades targeting bigger moves.
+https://t.me/+n4gTE50QU3BiM2U0
+
+Scalping Group (not for beginners) HIGH RISK
+Fast-paced setups throughout the day.
+https://t.me/+N5YFDmAHPwE5MGM0
+
+Asia & London Sessions (different time zones)
+Dedicated session trading with structured setups.
+https://t.me/+Z6Fq0YqPEdo5ZWE8
+
+Intraday Group
+Trading FX and XAU/USD throughout the day
+https://t.me/+l1dItG6YvJs3YWM0
+
+Education Group
+https://t.me/+A-gV6MD-PMs1YjVk
+
+Community
+https://t.me/+SRBSp3rDvndjMThk
+
+Once you have joined the channels, please ensure notifications are enabled so you do not miss any important updates, analysis, or live sessions.
+
+Keep us updated with your results! Just message "share results" here and send your screenshots, we love seeing how everyone is getting on.
+
+If you have any questions or require further support, do not hesitate to contact me."""
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
 
@@ -38,6 +69,26 @@ def notify_admin(text: str) -> None:
         requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": int(ADMIN_CHAT_ID), "text": text}, timeout=10)
     except Exception:
         pass
+
+
+def forward_photo_to_admin(from_chat_id, message_id, caption: str = "") -> bool:
+    """Copy a photo the user sent into the admin chat so it can actually be reviewed."""
+    if not TELEGRAM_API or not ADMIN_CHAT_ID:
+        return False
+    try:
+        r = requests.post(
+            f"{TELEGRAM_API}/copyMessage",
+            json={
+                "chat_id": int(ADMIN_CHAT_ID),
+                "from_chat_id": from_chat_id,
+                "message_id": message_id,
+                "caption": caption[:1000] if caption else None,
+            },
+            timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 def send_telegram_message(chat_id, text: str) -> bool:
@@ -85,6 +136,16 @@ def init_db():
                 );
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    member_id INT NOT NULL,
+                    sender TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    read_by_admin BOOLEAN DEFAULT FALSE
+                );
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS members (
                     id SERIAL PRIMARY KEY,
                     tier TEXT NOT NULL,
@@ -100,10 +161,17 @@ def init_db():
                     access_code TEXT,
                     chat_id BIGINT,
                     paid BOOLEAN DEFAULT FALSE,
+                    community_approved BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT NOW(),
                     approved_at TIMESTAMP
                 );
             """)
+            # migrations for existing installs
+            for col, coltype in [("community_approved", "BOOLEAN DEFAULT FALSE")]:
+                try:
+                    cur.execute(f"ALTER TABLE members ADD COLUMN IF NOT EXISTS {col} {coltype};")
+                except Exception:
+                    pass
     finally:
         conn.close()
 
@@ -112,6 +180,66 @@ try:
     init_db()
 except Exception:
     pass
+
+
+def add_message(member_id, sender, body):
+    conn = get_db()
+    if not conn:
+        return
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (member_id, sender, body, read_by_admin) VALUES (%s,%s,%s,%s)",
+                (member_id, sender, body, sender == "admin"))
+    finally:
+        conn.close()
+
+
+def get_messages(member_id):
+    conn = get_db()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM messages WHERE member_id=%s ORDER BY created_at ASC", (member_id,))
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_unread_count():
+    conn = get_db()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM messages WHERE read_by_admin = FALSE")
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_member_by_id(member_id):
+    conn = get_db()
+    if not conn:
+        return None
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM members WHERE id=%s", (member_id,))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def mark_messages_read(member_id):
+    conn = get_db()
+    if not conn:
+        return
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("UPDATE messages SET read_by_admin=TRUE WHERE member_id=%s", (member_id,))
+    finally:
+        conn.close()
 
 
 def gen_access_code():
@@ -162,6 +290,47 @@ def approve_member(member_id):
             """, (code, member_id))
             row = cur.fetchone()
             return row
+    finally:
+        conn.close()
+
+
+def grant_community(member_id):
+    """Approve community access. If they already have a main account, flag that one too."""
+    conn = get_db()
+    if not conn:
+        return None
+    try:
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM members WHERE id=%s", (member_id,))
+            req = cur.fetchone()
+            if not req:
+                return None
+            uname = (req.get("telegram_username") or "").lstrip("@").lower()
+            name = (req.get("name") or "").strip().lower()
+            # find their existing main account (gold or currency)
+            existing = None
+            if uname:
+                cur.execute("""SELECT * FROM members WHERE tier <> 'community'
+                               AND LOWER(REPLACE(COALESCE(telegram_username,''),'@','')) = %s
+                               AND status='approved' ORDER BY id DESC LIMIT 1""", (uname,))
+                existing = cur.fetchone()
+            if not existing and name:
+                cur.execute("""SELECT * FROM members WHERE tier <> 'community'
+                               AND LOWER(TRIM(COALESCE(name,''))) = %s
+                               AND status='approved' ORDER BY id DESC LIMIT 1""", (name,))
+                existing = cur.fetchone()
+
+            cur.execute("UPDATE members SET community_approved=TRUE, status='approved' WHERE id=%s", (member_id,))
+            if existing:
+                cur.execute("UPDATE members SET community_approved=TRUE WHERE id=%s", (existing["id"],))
+                cur.execute("SELECT * FROM members WHERE id=%s", (existing["id"],))
+                return cur.fetchone()
+            # no existing account, give this request its own code
+            code = gen_access_code()
+            cur.execute("UPDATE members SET access_code=%s, approved_at=NOW() WHERE id=%s AND access_code IS NULL",
+                        (code, member_id))
+            cur.execute("SELECT * FROM members WHERE id=%s", (member_id,))
+            return cur.fetchone()
     finally:
         conn.close()
 
@@ -2173,6 +2342,107 @@ footer a:hover { color: var(--gold); }
   .member-bar .wrap { gap: 18px; }
 }
 
+/* HER, women-only members space */
+.her-hero {
+  padding: 90px 0 60px;
+  background: linear-gradient(170deg, #FBF2EE 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--line);
+}
+.her-mark {
+  width: 108px; height: 108px;
+  border-radius: 50%;
+  border: 1px solid var(--rose);
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 26px;
+  font-family: 'Fraunces', serif;
+  font-size: 13px;
+  line-height: 1.3;
+  text-align: center;
+  color: var(--rose);
+  letter-spacing: 0.1em;
+  position: relative;
+  background: rgba(255,255,255,0.5);
+}
+.her-mark::before {
+  content: "";
+  position: absolute; inset: 7px;
+  border-radius: 50%;
+  border: 1px solid rgba(201,162,155,0.35);
+}
+.her-panel {
+  background: linear-gradient(160deg, #FBF2EE, var(--bg-alt));
+  border: 1px solid rgba(201,162,155,0.35);
+  border-radius: 18px;
+  padding: 30px;
+}
+.her-icon {
+  width: 44px; height: 44px;
+  border: 1px solid var(--rose);
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--rose);
+  margin: 0 auto 16px;
+  font-size: 17px;
+}
+.her-card {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 22px 26px;
+  margin-bottom: 12px;
+  background: var(--bg-alt);
+  border: 1px solid rgba(201,162,155,0.3);
+  border-radius: 16px;
+  color: var(--ink);
+  transition: all 0.2s ease;
+}
+.her-card:hover {
+  border-color: var(--rose);
+  transform: translateX(3px);
+  box-shadow: 0 10px 26px rgba(201,162,155,0.16);
+}
+.her-card.small { padding: 16px 22px; }
+.her-num {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  color: var(--rose);
+  flex-shrink: 0;
+}
+.her-title {
+  font-family: 'Fraunces', serif;
+  font-size: 18px;
+  flex: 1;
+}
+.her-card.small .her-title { font-size: 16px; font-family: 'Inter'; }
+.her-arrow { color: var(--rose); flex-shrink: 0; }
+.her-quotes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 18px;
+}
+.her-quote {
+  background: linear-gradient(160deg, #FBF2EE, var(--bg-alt));
+  border: 1px solid rgba(201,162,155,0.3);
+  border-radius: 16px;
+  padding: 26px;
+}
+.her-quote p {
+  font-family: 'Fraunces', serif;
+  font-size: 17px;
+  line-height: 1.5;
+  color: var(--ink);
+  margin: 0 0 10px;
+}
+.her-quote cite {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--rose);
+}
+@media (max-width: 860px) {
+  .her-hero h1 { font-size: 34px !important; }
+  .her-quotes { grid-template-columns: 1fr; }
+}
+
 /* Floating support button */
 .support-float {
   position: fixed;
@@ -2228,18 +2498,26 @@ def base_layout(title: str, content: str, active: str = "") -> str:
     except Exception:
         logged_in = False
 
+    try:
+        has_community = bool(session.get("member_community"))
+    except Exception:
+        has_community = False
+
+    community_label = "Female Wealth" if has_community else "Community"
+
     if logged_in:
         nav_cta = '<a href="/account" class="nav-cta">My Account</a>'
-        member_bar = """
+        member_bar = f"""
 <div class="member-bar">
   <div class="wrap">
     <span class="member-bar-label">Your access</span>
     <a href="/account">My Account</a>
+    <a href="/messages">Messages</a>
     <a href="/education/fundamentals/0">Fundamentals</a>
     <a href="/education/fundamentals/contents">All Lessons</a>
     <a href="/education/advanced/0">Advanced</a>
     <a href="/signals">Extra Signals</a>
-    <a href="/community">Community</a>
+    <a href="/community">{community_label}</a>
   </div>
 </div>
 """
@@ -2324,6 +2602,12 @@ def admin():
 
     pending = get_pending_members()
     approved = get_approved_members()
+    unread = get_unread_count()
+    unread_banner = (
+        f'<div class="callout" style="margin-bottom:28px;">💬 You have {unread} unread message'
+        f'{"s" if unread != 1 else ""} from members. Look for the Messages link on each person below.</div>'
+        if unread else ""
+    )
 
     def row(m, show_approve=True, show_paid=False):
         fields = f"{m.get('title','')} {m['name']} · {m['tier']} · Acct {m['account_number']} · £{m['deposit_amount']} · {m['phone']}"
@@ -2332,7 +2616,7 @@ def admin():
             extra = f"<br><span style='color: var(--ink-dim); font-size: 12px;'>Code entered: {m.get('verification_code','') or '(none)'}, chat linked: {'yes' if m.get('chat_id') else 'NO chat_id found'}</span>"
         else:
             extra = f"<br><span style='color: var(--ink-dim); font-size: 12px;'>Referred by: {m.get('referred_by','')}, Telegram: {m.get('telegram_username','')}, chat linked: {'yes' if m.get('chat_id') else 'NO chat_id found'}</span>"
-        actions = ""
+        actions = f'<div style="margin-top:10px;"><a href="/admin/messages/{m["id"]}" class="inline-link" style="font-size:13px;">💬 Messages</a></div>'
         if show_approve:
             actions = f'<form method="POST" action="/admin/approve/{m["id"]}" style="margin-top:10px;"><button type="submit" class="btn btn-primary" style="padding: 8px 18px; font-size: 13px;">Approve & Send</button></form>'
         if show_paid and not m.get('paid'):
@@ -2346,7 +2630,18 @@ def admin():
 <section style="padding: 60px 0;">
   <div class="wrap">
     <span class="eyebrow">Admin</span>
-    <h1 style="font-size: 30px; margin: 10px 0 40px;">Pending & Members</h1>
+    <h1 style="font-size: 30px; margin: 10px 0 30px;">Pending & Members</h1>
+    {unread_banner}
+
+    <div class="form-panel" style="margin-bottom: 44px; max-width: 100%;">
+      <h3 style="font-size: 17px; margin-bottom: 6px;">Send a verification code</h3>
+      <p style="color: var(--ink-dim); font-size: 13px; margin: 0 0 12px;">After checking someone's onboarding screenshots, send them their code. Enter their @username (or chat ID if they have none).</p>
+      <form method="POST" action="/admin/send-code" style="display: flex; gap: 12px; align-items: center;">
+        <input type="text" name="target" placeholder="@username or chat ID" style="flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--ink); padding: 12px 14px; border-radius: 10px;">
+        <button type="submit" style="width: auto; margin: 0; padding: 12px 24px;">Send Code</button>
+      </form>
+    </div>
+
     <h2 style="font-size: 20px; margin-bottom: 16px;">Pending ({len(pending)})</h2>
     <div class="grid5" style="grid-template-columns: 1fr; margin-bottom: 48px;">{pending_html}</div>
     <h2 style="font-size: 20px; margin-bottom: 16px;">Approved ({len(approved)})</h2>
@@ -2357,24 +2652,148 @@ def admin():
     return render_template_string(base_layout("Admin", content, ""))
 
 
+@app.route("/admin/messages/<int:member_id>", methods=["GET", "POST"])
+def admin_messages(member_id):
+    if not session.get("admin"):
+        return redirect(url_for("admin"))
+
+    member = get_member_by_id(member_id)
+    if not member:
+        return redirect(url_for("admin"))
+
+    if request.method == "POST":
+        body = request.form.get("body", "").strip()
+        if body:
+            add_message(member_id, "admin", body)
+            if member.get("chat_id"):
+                send_telegram_message(
+                    member["chat_id"],
+                    f"New message from Inner Circle:\n\n{body}\n\n"
+                    f"Reply at https://innercircletrading.co/messages"
+                )
+        return redirect(url_for("admin_messages", member_id=member_id))
+
+    mark_messages_read(member_id)
+    msgs = get_messages(member_id)
+    if msgs:
+        thread = "".join(
+            f'<div style="margin-bottom: 18px; text-align: {"left" if m["sender"]=="member" else "right"};">'
+            f'<div style="display: inline-block; max-width: 80%; text-align: left; padding: 12px 16px; border-radius: 14px; '
+            f'background: {"var(--bg-alt-2)" if m["sender"]=="member" else "var(--gold)"}; '
+            f'color: {"var(--ink)" if m["sender"]=="member" else "var(--bg)"};">'
+            f'<div style="font-size: 11px; opacity: 0.7; margin-bottom: 4px;">{member.get("name","Member") if m["sender"]=="member" else "You"}</div>'
+            f'{m["body"]}</div></div>'
+            for m in msgs
+        )
+    else:
+        thread = '<p style="color: var(--ink-dim); text-align: center; padding: 30px 0;">No messages yet.</p>'
+
+    tg = member.get("telegram_username") or ""
+    tg_line = f'<a href="https://t.me/{tg.lstrip("@")}" target="_blank" class="inline-link">Message on Telegram</a>' if tg else '<span style="color: var(--ink-dim);">No Telegram username on file, use this portal to reach them</span>'
+
+    content = f"""
+<section style="padding: 60px 0;">
+  <div class="wrap" style="max-width: 640px;">
+    <a href="/admin" class="inline-link" style="font-size: 13px;">← Back to admin</a>
+    <h1 style="font-size: 26px; margin: 16px 0 6px;">{member.get('title','')} {member.get('name','Member')}</h1>
+    <p style="color: var(--ink-dim); font-size: 14px; margin-bottom: 8px;">
+      {member.get('tier','')} · Acct {member.get('account_number') or 'n/a'} · {member.get('phone') or 'no phone'}
+    </p>
+    <p style="font-size: 13px; margin-bottom: 28px;">{tg_line}</p>
+    <div class="form-panel" style="max-width: 100%; margin-bottom: 22px;">{thread}</div>
+    <div class="form-panel" style="max-width: 100%;">
+      <form method="POST">
+        <label>Your reply</label>
+        <input type="text" name="body" placeholder="Type your reply..." required>
+        <button type="submit">Send Reply</button>
+      </form>
+      <p style="color: var(--ink-dim); font-size: 12px; margin-top: 12px;">They'll get this in the portal, and on Telegram too if we have their chat linked.</p>
+    </div>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Messages", content, ""))
+
+
+@app.route("/admin/send-code", methods=["POST"])
+def admin_send_code():
+    if not session.get("admin"):
+        return redirect(url_for("admin"))
+    target = request.form.get("target", "").strip().lstrip("@")
+    if not target:
+        return redirect(url_for("admin"))
+
+    chat_id = None
+    if target.lstrip("-").isdigit():
+        chat_id = int(target)
+    else:
+        conn = get_db()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT chat_id FROM bot_contacts WHERE username = %s", (target.lower(),))
+                    row = cur.fetchone()
+                    if row:
+                        chat_id = row[0]
+            finally:
+                conn.close()
+
+    if chat_id:
+        code = "IC-" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5))
+        save_verification_code(code, chat_id, target, 2)
+        send_telegram_message(
+            chat_id,
+            f"Great news, your screenshots have been checked and everything looks right!\n\n"
+            f"Your verification code is: {code}\n\n"
+            f"Pop that into the form on the website along with your details and we'll get you approved."
+        )
+    else:
+        notify_admin(f"Couldn't find a chat for '{target}'. They need to message the bot first.")
+    return redirect(url_for("admin"))
+
+
 @app.route("/admin/approve/<int:member_id>", methods=["POST"])
 def admin_approve(member_id):
     if not session.get("admin"):
         return redirect(url_for("admin"))
 
+    pre = get_member_by_id(member_id)
+    if pre and pre.get("tier") == "community":
+        member = grant_community(member_id)
+        if member:
+            msg = (
+                "You're in! Welcome to Wealth Circle \U0001F90D\n\n"
+                "Here's your invite to our private women-only community:\n"
+                "https://t.me/+TWaAqQlTTuU1OGU0\n\n"
+                "You've also unlocked Female Wealth on the website, your private space with masterclasses, "
+                "personal development and the group link any time you need it:\n"
+                "https://innercircletrading.co/community\n\n"
+                + (f"Log in with your access code: {member.get('access_code')}\n"
+                   f"https://innercircletrading.co/unlock\n\n" if member.get('access_code') else "")
+                + "If you're already logged in on the website, just log out and back in to see it appear."
+            )
+            if member.get("chat_id"):
+                send_telegram_message(member["chat_id"], msg)
+            else:
+                notify_admin(f"Could not auto-message community member {member_id}. Send manually:\n\n{msg}")
+        return redirect(url_for("admin"))
+
     member = approve_member(member_id)
     if member:
-        group_link = GOLD_GROUP_LINK if member["tier"] == "gold" else CURRENCY_GROUP_LINK
-        tier_label = "gold signals" if member["tier"] == "gold" else "currency signals"
-        msg = (
-            f"You're approved! Welcome to Inner Circle.\n\n"
-            f"Your {tier_label} Telegram group:\n{group_link}\n\n"
-            f"Your website access code: {member['access_code']}\n\n"
-            f"To unlock your Education access, go to:\n"
-            f"https://innercircletrading.co/unlock\n\n"
-            f"Enter your code there and you're in. Keep this code safe, you'll need it again if you "
-            f"switch phone or clear your browser."
-        )
+        if member["tier"] == "gold":
+            msg = (
+                f"You're approved! Welcome to Inner Circle.\n\n"
+                f"Your gold signals Telegram group:\n{GOLD_GROUP_LINK}\n\n"
+                f"Your website access code: {member['access_code']}\n\n"
+                f"To unlock your Education access, go to:\n"
+                f"https://innercircletrading.co/unlock\n\n"
+                f"Enter your code there and you're in. Keep this code safe, you'll need it again if you "
+                f"switch phone or clear your browser.\n\n"
+                f"Keep us updated with your results! Just message \"share results\" here and send your "
+                f"screenshots, we love seeing how everyone is getting on."
+            )
+        else:
+            msg = CURRENCY_APPROVED_MESSAGE
         if member.get("chat_id"):
             send_telegram_message(member["chat_id"], msg)
         else:
@@ -2402,6 +2821,7 @@ def unlock():
             session["member_id"] = member["id"]
             session["member_tier"] = member["tier"]
             session["member_paid"] = member.get("paid", False)
+            session["member_community"] = bool(member.get("community_approved")) or (member.get("tier") == "community")
             session["member_name"] = member.get("name", "")
             return redirect(url_for("account"))
         error = "That code wasn't recognised, double check it or contact us for help."
@@ -2436,6 +2856,7 @@ def unlock():
 # in-memory per-chat photo counter for the current verification attempt
 _photo_counts = {}
 _payment_pending = {}
+_results_pending = {}
 
 
 def upsert_bot_contact(username, chat_id):
@@ -2618,6 +3039,122 @@ Worth saying, the deposit goes into your own broker account. It's your money, it
 
 # Each entry: (list of trigger keywords, reply, whether it offers the steps next)
 KEYWORD_REPLIES = [
+    (["menu", "options", "what can you do", "what can you help", "list"],
+     """Here's what I can point you to:
+
+🚀 ONBOARDING, getting set up with your account and signals
+📚 EDUCATION, our free beginners course, 41 lessons
+📈 ADVANCED EDUCATION, chart reading, £99 one-time
+👭 COMMUNITY, Wealth Circle, our private women-only group
+➕ EXTRA SIGNALS, more groups and more coverage
+
+Just say the word and I'll take you through it.""",
+     False),
+
+    (["hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+      "hiya", "heya", "yo ", "hey there", "hi there", "morning", "evening"],
+     """Hey, welcome to Inner Circle! 👋
+
+Let me know how I can help. Here's what I can point you to:
+
+🚀 ONBOARDING, getting set up with your account and signals
+📚 EDUCATION, our free beginners course, 41 lessons
+📈 ADVANCED EDUCATION, chart reading, £99 one-time
+👭 COMMUNITY, Wealth Circle, our private women-only group
+➕ EXTRA SIGNALS, more groups and more coverage
+
+Just say the word and I'll take you through it. Or ask me anything else, deposits, MT5, lot sizes, whatever you need.""",
+     False),
+
+    (["what is a pip", "whats a pip", "what's a pip", "define pip", "explain pip",
+      "what does pip mean", "pips mean", "what are pips"],
+     """A pip is just the smallest standard price movement, it's how traders measure how far price has moved. So if someone says a trade made 20 pips, that's the distance it travelled in your favour.
+
+That's exactly the sort of thing our free beginners course covers properly, all the terminology explained in plain English with diagrams. Would you like the steps to get access?""",
+     True),
+
+    (["who are you", "what are you", "are you a bot", "are you real", "are you human",
+      "am i talking to a person", "is this a bot", "real person", "your name"],
+     """I'm the Inner Circle support assistant, an automated helper here to answer questions and get you set up.
+
+If you'd rather speak to someone from the team directly, just say and I'll pass you over. What can I help with?""",
+     False),
+
+    (["what is inner circle", "what do you do", "tell me about", "what is this",
+      "whats this about", "what's this about", "explain inner circle", "about you"],
+     """So Inner Circle is a trading signals and education community. Three main parts to it:
+
+1. Copy and paste signals, we send the pair, direction and levels, you enter them exactly as they are.
+2. A free beginners course, 41 lessons taking you from complete beginner to placing trades with confidence.
+3. Wealth Circle, our private women-only community.
+
+Joining is completely free. Would you like the steps to get started?""",
+     True),
+
+    (["advanced course", "chart reading", "technical analysis", "advanced training",
+      "paid course", "99", "£99", "advanced access", "unlock advanced", "advanced"],
+     """The Advanced Chart Reading course is £99 one-time, 23 lessons on candlesticks, market structure, liquidity, Fibonacci and building your own strategy.
+
+Quick check first though, have you already been through our free beginners course? It's worth doing that one first as Advanced builds straight on top of it.
+
+If you're ready, head to innercircletrading.co/education/advanced and there's a payment link right there.""",
+     False),
+
+    (["fundamentals", "free course", "beginners course", "basics course", "enrol", "enroll",
+      "how do i access the course", "access the course", "start the course"],
+     """The free beginners course unlocks once you've completed onboarding and been approved.
+
+If you've already got your access code, just head to innercircletrading.co/unlock and pop it in.
+
+Not started yet? Would you like the steps to get set up?""",
+     True),
+
+    (["join community", "wealth circle", "womens group", "women's group", "female group",
+      "join the community", "community access", "request community"],
+     """Wealth Circle is our private women-only community. It's a supportive space to ask questions and share wins without the noise you get in most trading groups.
+
+You'll need to have completed onboarding first, then you can request to join at innercircletrading.co/community and we'll review it personally.
+
+Want the steps to get onboarded first?""",
+     True),
+
+    (["where do i go", "which page", "what page", "where is", "how do i find",
+      "cant find the page", "can't find the page", "website", "the site", "link to site"],
+     """Everything lives at innercircletrading.co. Quick map:
+
+Onboarding, /onboarding
+Log in with your code, /unlock
+Courses, /education
+Community request, /community
+Extra signals, /signals
+
+What were you trying to find?""",
+     False),
+
+    (["extra signals", "more signals", "other signals", "currency signals",
+      "additional signals", "pu prime", "puprime", "second account"],
+     """Extra signals unlock more groups, currency pairs, different sessions and different styles.
+
+Quick check though, have you already completed the main onboarding and got your gold signals running? It's worth having that sorted first.
+
+If you're all set there, head to innercircletrading.co/signals and the steps are laid out. You'll register a PU Prime account, then fill in the form and we'll approve you.""",
+     False),
+
+    (["my code", "access code", "lost my code", "forgot my code", "code not working",
+      "cant log in to the site", "wont accept my code", "invalid code"],
+     """No problem. Your access code looks like AC-XXXXXXX and you enter it at innercircletrading.co/unlock.
+
+If it's not being accepted, double check for spaces at the start or end. Still stuck? Let me know and I'll get the team to resend it.""",
+     False),
+
+    (["thanks", "thank you", "cheers", "appreciate it", "ta ", "thankyou", "nice one"],
+     """You're very welcome! Anything else you need, just ask.""",
+     False),
+
+    (["bye", "goodbye", "see you", "later", "cya", "speak soon"],
+     """No worries, speak soon! I'm here whenever you need anything.""",
+     False),
+
     (["how do i trade", "how to trade", "how does trading work", "how do you trade",
       "how does it work", "how do i place", "how to place", "teach me"],
      """Good question, and honestly it's simpler than most people expect once someone actually shows you. You pick what you're trading, choose your direction, set your size and your safety levels, then place it.
@@ -2628,7 +3165,8 @@ Our free beginners course walks you through the whole thing step by step with sc
      True),
 
     (["how do i start", "how can i start", "how to start", "how do i join", "how to join",
-      "want to join", "sign up", "get started", "getting started", "how do i get in"],
+      "want to join", "sign up", "get started", "getting started", "how do i get in",
+      "onboarding", "onboard", "set up", "setup", "register"],
      GETTING_STARTED, False),
 
     (["is it free", "how much does it cost", "what does it cost", "is there a fee",
@@ -2975,19 +3513,33 @@ def telegram_webhook():
         except Exception:
             pass
 
+    WELCOME_MENU = (
+        "Hey, welcome to Inner Circle! 👋\n\n"
+        "Let me know how I can help. Here's what I can point you to:\n\n"
+        "🚀 ONBOARDING\n"
+        "Getting set up with your account and signals. Just say \"onboarding\" or \"how do I start\".\n\n"
+        "📚 EDUCATION\n"
+        "Our free beginners course, 41 lessons. Say \"course\" or \"education\".\n\n"
+        "📈 ADVANCED EDUCATION\n"
+        "Chart reading and technical analysis, £99 one-time. Say \"advanced\".\n\n"
+        "👭 COMMUNITY\n"
+        "Wealth Circle, our private women-only group. Say \"community\".\n\n"
+        "➕ EXTRA SIGNALS\n"
+        "More groups, more coverage, currency pairs. Say \"extra signals\".\n\n"
+        "Or just ask me anything, deposits, MT5, lot sizes, whatever you need.\n\n"
+        "Sending screenshots for verification? Just send them straight here."
+    )
+
     if text == "/start":
-        reply(
-            "Hey, welcome to Inner Circle! 👋\n\n"
-            "If you're going through onboarding, send me your deposit confirmation and your closed trades screenshots "
-            "and I'll get your verification code sorted.\n\n"
-            "Joining Extra Signals instead? Just saying hi here is enough, that links your account so we can send your "
-            "group link once you're approved.\n\n"
-            "Any questions at all, just ask."
-        )
+        reply(WELCOME_MENU)
+        return "ok"
+
+    if text in ("menu", "/menu", "options", "help me", "what can you do", "/options"):
+        reply(WELCOME_MENU)
         return "ok"
 
     if text == "/help":
-        reply("Ask me anything about getting set up, deposits, MT5, the courses, or your verification code. If I can't help, I'll pass you to the team.")
+        reply(WELCOME_MENU)
         return "ok"
 
     # Detect someone flagging an Advanced course payment
@@ -2999,6 +3551,17 @@ def telegram_webhook():
     is_payment_text = any(w in text for w in payment_words)
     is_payment_caption = any(w in caption for w in payment_words)
 
+    msg_id = message.get("message_id")
+
+    def contact_block():
+        if username:
+            return f"From: @{username}\nReply: https://t.me/{username}"
+        first = (message.get("from", {}).get("first_name") or "").strip()
+        return (f"From: {first or 'Unknown'} (NO @username set)\n"
+                f"Chat ID: {chat_id}\n"
+                f"They have no username, so reply to the forwarded photo below to reach them.")
+
+    # --- Advanced payment screenshots ---
     if photos and (is_payment_caption or _payment_pending.get(chat_id)):
         _payment_pending.pop(chat_id, None)
         _photo_counts[chat_id] = 0
@@ -3007,15 +3570,8 @@ def telegram_webhook():
             "They'll review it and unlock your Advanced Chart Reading access, usually well within 24 hours. "
             "You'll get a message here the moment it's live."
         )
-        if username:
-            contact_line = f"From: @{username}\nReply: https://t.me/{username}"
-        else:
-            contact_line = f"From: chat ID {chat_id} (no @username set on their account)"
-        notify_admin(
-            f"💷 ADVANCED COURSE PAYMENT SCREENSHOT\n\n{contact_line}\n\n"
-            f"Caption: {message.get('caption') or '(none)'}\n\n"
-            f"Check the screenshot in your Telegram chat with them, then Mark Paid at /admin."
-        )
+        notify_admin(f"💷 ADVANCED COURSE PAYMENT\n\n{contact_block()}\n\nScreenshot below:")
+        forward_photo_to_admin(chat_id, msg_id)
         return "ok"
 
     if is_payment_text and not photos:
@@ -3027,17 +3583,42 @@ def telegram_webhook():
         )
         return "ok"
 
+    # --- Sharing results ---
+    results_words = ["share results", "my results", "share my results", "sharing results",
+                     "here are my results", "results from", "my profit", "my wins"]
+    if any(w in text for w in results_words) and not photos:
+        _results_pending[chat_id] = True
+        reply("Love it, send your screenshots over and I'll pass them straight to the team. Always great to see how everyone's getting on.")
+        return "ok"
+
+    if photos and _results_pending.get(chat_id):
+        _results_pending.pop(chat_id, None)
+        reply("Brilliant, thanks for sharing! Passed straight to the team.")
+        notify_admin(f"🎉 MEMBER RESULTS\n\n{contact_block()}\n\nScreenshot below:")
+        forward_photo_to_admin(chat_id, msg_id)
+        return "ok"
+
+    # --- Onboarding verification screenshots ---
     if photos:
         _photo_counts.setdefault(chat_id, 0)
         _photo_counts[chat_id] += 1
         count = _photo_counts[chat_id]
+        forward_photo_to_admin(chat_id, msg_id)
         if count == 1:
+            notify_admin(f"📸 ONBOARDING PHOTO 1 of 2\n\n{contact_block()}\n\nImage below. Waiting on their second screenshot.")
             reply("Got your first screenshot! Send the second one over too, we need your deposit confirmation and your closed trades history.")
         elif count >= 2:
-            code = "IC-" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5))
-            save_verification_code(code, chat_id, username, count)
-            reply(f"Both screenshots received, thank you! Your verification code is: {code}\n\nPop that into the onboarding form on the website and you're all set.")
             _photo_counts[chat_id] = 0
+            notify_admin(
+                f"📸 ONBOARDING PHOTO 2 of 2, READY TO REVIEW\n\n{contact_block()}\n\n"
+                f"Image below. Check both images are correct (deposit confirmation + 10 closed trades), "
+                f"then approve at https://innercircletrading.co/admin to send their code."
+            )
+            reply(
+                "Both screenshots received, thank you! I've sent them over to our admin team to check.\n\n"
+                "Once they've confirmed everything looks right, you'll get your verification code here, "
+                "usually well within 24 hours. Then you can pop it into the form on the website."
+            )
         return "ok"
 
     if text:
@@ -3047,16 +3628,16 @@ def telegram_webhook():
         if matched:
             reply(answer)
         else:
-            reply("Good question, let me get someone from the team to answer that one properly for you. They'll be in touch shortly.")
-            if username:
-                contact_line = f"From: @{username}\nReply: https://t.me/{username}"
-            else:
-                contact_line = (
-                    f"From: chat ID {chat_id} (no @username set on their account)\n"
-                    f"They'll need to set a Telegram username, or you can reply via the bot."
-                )
+            reply(
+                "Good question, I want to make sure you get the right answer on that one so I'm passing it "
+                "to the team, they'll be in touch shortly.\n\n"
+                "In the meantime, if it helps, I can cover: getting started, deposits, MT5 setup, "
+                "the courses, the community, extra signals, or your access code. Just ask."
+            )
             notify_admin(
-                f"Unanswered bot message\n\n{contact_line}\n\nTheir message:\n{original_text}"
+                f"❓ UNANSWERED MESSAGE\n\n{contact_block()}\n\nTheir message:\n{original_text}\n\n"
+                f"To reply: use the Send Code box style lookup at /admin, or reply to any photo they've "
+                f"sent you. If they have no @username, ask them to set one in Telegram settings."
             )
 
     return "ok"
@@ -3072,6 +3653,15 @@ def account():
     paid = session.get("member_paid", False)
 
     tier_label = "Gold signals" if tier == "gold" else "Currency signals"
+    her_row = (
+        '<strong style="color: var(--rose);">✓ Female Wealth</strong>'
+        '<br><span style="color: var(--ink-dim); font-size: 13px;">Unlocked, mindset lessons and your group link</span>'
+        '<br><a href="/community" class="inline-link" style="font-size: 13px;">Open Female Wealth →</a>'
+        if session.get("member_community") else
+        '<span style="color: var(--ink-dim);">🔒 Female Wealth</span>'
+        '<br><span style="color: var(--ink-dim); font-size: 13px;">Women-only community, request access</span>'
+        '<br><a href="/community" class="inline-link" style="font-size: 13px;">Request to join →</a>'
+    )
 
     advanced_row = (
         '<li style="padding: 14px 0; border-bottom: 1px solid var(--line);">'
@@ -3104,6 +3694,9 @@ def account():
           <br><a href="/education/fundamentals/0" class="inline-link" style="font-size: 13px;">Open course →</a>
         </li>
         {advanced_row}
+        <li style="padding: 14px 0; border-bottom: 1px solid var(--line);">
+          {her_row}
+        </li>
         <li style="padding: 14px 0;">
           <strong>Extra Signals</strong>
           <br><span style="color: var(--ink-dim); font-size: 13px;">Add a second account for currency signals</span>
@@ -3113,13 +3706,66 @@ def account():
     </div>
 
     <p style="color: var(--ink-dim); font-size: 13px; margin-top: 28px;">
-      Need help? Message us on <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="inline-link">Telegram</a>.
+      Need help? <a href="/messages" class="inline-link">Message us here</a>, or on <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="inline-link">Telegram</a>.
       <br><a href="/logout" class="inline-link">Log out</a>
     </p>
   </div>
 </section>
 """
     return render_template_string(base_layout("My Account", content, ""))
+
+
+@app.route("/messages", methods=["GET", "POST"])
+def member_messages():
+    if not is_verified():
+        return redirect(url_for("unlock"))
+
+    member_id = session.get("member_id")
+
+    if request.method == "POST":
+        body = request.form.get("body", "").strip()
+        if body:
+            add_message(member_id, "member", body)
+            notify_admin(
+                f"💬 NEW MESSAGE FROM MEMBER\n\n"
+                f"{session.get('member_name','Member')} (ID {member_id})\n\n"
+                f"{body}\n\n"
+                f"Reply at https://innercircletrading.co/admin/messages/{member_id}"
+            )
+        return redirect(url_for("member_messages"))
+
+    msgs = get_messages(member_id)
+    if msgs:
+        thread = "".join(
+            f'<div style="margin-bottom: 18px; text-align: {"right" if m["sender"]=="member" else "left"};">'
+            f'<div style="display: inline-block; max-width: 80%; text-align: left; padding: 12px 16px; border-radius: 14px; '
+            f'background: {"var(--bg-alt-2)" if m["sender"]=="member" else "var(--gold)"}; '
+            f'color: {"var(--ink)" if m["sender"]=="member" else "var(--bg)"};">'
+            f'<div style="font-size: 11px; opacity: 0.7; margin-bottom: 4px;">{"You" if m["sender"]=="member" else "Inner Circle"}</div>'
+            f'{m["body"]}</div></div>'
+            for m in msgs
+        )
+    else:
+        thread = '<p style="color: var(--ink-dim); text-align: center; padding: 30px 0;">No messages yet. Send us anything you need below.</p>'
+
+    content = f"""
+<section style="padding: 60px 0;">
+  <div class="wrap" style="max-width: 620px;">
+    <a href="/account" class="inline-link" style="font-size: 13px;">← Back to my account</a>
+    <h1 style="font-size: 28px; margin: 16px 0 8px;">Messages</h1>
+    <p style="color: var(--ink-dim); margin-bottom: 30px;">Message us directly here, we'll reply as soon as we can.</p>
+    <div class="form-panel" style="max-width: 100%; margin-bottom: 22px;">{thread}</div>
+    <div class="form-panel" style="max-width: 100%;">
+      <form method="POST">
+        <label>Your message</label>
+        <input type="text" name="body" placeholder="Type your message..." required>
+        <button type="submit">Send</button>
+      </form>
+    </div>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Messages", content, ""))
 
 
 @app.route("/logout")
@@ -3137,6 +3783,10 @@ def is_verified():
 
 def is_paid():
     return bool(session.get("member_paid"))
+
+
+def is_community():
+    return bool(session.get("member_community"))
 
 
 def locked_page(reason_text, cta_text, cta_url):
@@ -3434,13 +4084,13 @@ def signals():
         <h3>Let us know who referred you</h3>
         <p>Tap the name. A link will open taking you to create your PU Prime account. Don't close this page, you'll need to come back to it.</p>
         <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px;">
-          <a href="#" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Charlotte</a>
-          <a href="#" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Beth</a>
-          <a href="#" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Robbie</a>
-          <a href="#" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Lucy</a>
-          <a href="#" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Lydia</a>
+          <a href="https://t.me/Innercircleverifybot" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Charlotte</a>
+          <a href="https://t.me/Innercircleverifybot" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Beth</a>
+          <a href="https://t.me/Innercircleverifybot" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Robbie</a>
+          <a href="https://t.me/Innercircleverifybot" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Lucy</a>
+          <a href="https://t.me/Innercircleverifybot" class="btn btn-ghost" style="padding: 12px 24px;" target="_blank" rel="noopener">Lydia</a>
         </div>
-        <div class="callout">⚠️ Once you've registered, come straight back to this page, the next steps are right here below.</div>
+        <div class="callout">Tapping a name will connect you with us to get your personal registration link. Once you've registered, come straight back to this page, the next steps are right here below.</div>
       </div>
     </div>
 
@@ -3818,7 +4468,9 @@ def lesson_page(course_slug, course_title, lessons, idx, diagrams, diagram_prefi
     next_html = (
         f'<a href="/education/{course_slug}/{idx+1}" class="btn btn-primary">Next →</a>'
         if idx < len(lessons) - 1
-        else f'<a href="{unlock_url}" class="btn btn-primary">{unlock_label}</a>'
+        else (f'<a href="{unlock_url}" class="btn btn-primary">{unlock_label}</a>'
+              if unlock_label else
+              f'<a href="{back_url}" class="btn btn-primary">Finish, back to overview</a>')
     )
 
     content = f"""
@@ -3941,7 +4593,7 @@ def education_fundamentals_lesson(idx):
     return lesson_page(
         "fundamentals", "Trading Fundamentals", lessons, idx,
         FUND_DIAGRAMS, "FDIAGRAM",
-        "/education/fundamentals", "Start Onboarding to Unlock", "/onboarding"
+        "/education/fundamentals", "Unlock Advanced Chart Reading (£99)", "/education/advanced/0"
     )
 
 
@@ -4036,7 +4688,7 @@ def education_advanced_lesson(idx):
     return lesson_page(
         "advanced", "Advanced Chart Reading", lessons, idx,
         CHART_DIAGRAMS, "DIAGRAM",
-        "/education/advanced", "Unlock After Purchase", "/onboarding"
+        "/education/advanced", "", ""
     )
 
 
@@ -4092,45 +4744,891 @@ def education():
     return render_template_string(base_layout("Education", content, "education"))
 
 
-@app.route("/community")
-def community():
+HER_MASTERCLASSES = [
+    ("Becoming HER: The Foundation", """This is where it starts, and honestly it has very little to do with money at first.
+
+Becoming HER means deciding you're someone who handles her own finances. Not someone who's going to, one day, when things calm down. Someone who does, now, imperfectly.
+
+That decision comes before the skill. The skill follows the decision, not the other way around.
+
+**What we're doing in this masterclass**
+
+Most women were never taught to see themselves as someone who invests. We were taught to save, to budget, to be careful, to not take up too much space. Useful things, but they're defensive. They keep you where you are.
+
+Building wealth is offensive. It requires you to take up space on purpose.
+
+**The three shifts**
+
+1. From "I'm not good with money" to "I haven't been taught this yet." One is an identity, the other is a gap. Only one of them can be closed.
+2. From secrecy to clarity. Knowing exactly what you have, what you owe, what comes in. Most people avoid this because it feels shameful. Clarity is what makes everything else possible.
+3. From permission to decision. You don't need anyone's approval to build this.
+
+**Your work this week**
+
+Write down, honestly and privately, what you actually have. Every account, every debt, every number. Don't judge it, just see it.
+
+Then write one sentence: "I am someone who..." and finish it with who you're becoming."""),
+
+    ("Becoming HER: Believing You're Capable", """Before anything changes on the outside, something has to shift in what you believe is available to you.
+
+Not in a woo way. In a practical, evidence-based way.
+
+**The gap between capable and believing you're capable**
+
+Most women reading this are already capable. You manage far more than you give yourself credit for. You've handled harder things than reading a chart.
+
+The gap isn't ability. It's that nobody ever reflected your capability back to you in this particular area, so you assumed it wasn't yours.
+
+**Where "I can't" actually comes from**
+
+Usually one of three places:
+
+1. Someone told you once, and you believed them.
+2. You tried something adjacent, it went badly, and you generalised.
+3. You've never seen a woman like you do it, so it doesn't feel available.
+
+None of those are evidence about your ability. They're evidence about your exposure.
+
+**Building belief on purpose**
+
+Belief follows proof. So build small proof deliberately:
+
+- Do one thing you said you couldn't. Small. Place one 0.01 trade correctly.
+- Note it. Actually write it down, or the brain discards it.
+- Repeat until the story starts to argue back.
+
+**Your work this week**
+
+Write: "I used to think I couldn't ______, and now I ______."
+
+Fill it in with anything from your life. Driving. A job. Leaving something. You've done this before. This is the same process pointed at money."""),
+
+    ("Manifestation, Done Properly", """Let's be honest about what this is and isn't.
+
+Manifestation isn't wishing and waiting. Nothing arrives because you thought about it hard enough.
+
+What it actually is: getting specific about what you want, so your attention and decisions start organising around it. That's not magic, that's how focus works. You notice what you're primed to notice.
+
+**Why vague goals fail**
+
+"I want more money" gives your brain nothing to act on. "I want £500 a month extra by summer so I can stop dreading the school holidays" is a target. One of those changes what you do on a Tuesday.
+
+**The three parts**
+
+1. **Specific.** Amount, timeframe, and what it's actually for. The 'for' matters most, it's what keeps you going when it's boring.
+2. **Emotional.** Not the number, the feeling underneath it. Safety? Freedom? Not having to ask? Get honest, most money goals are really about something else.
+3. **Behavioural.** What does someone who has that already do daily? Start doing one of those things now.
+
+**The uncomfortable part**
+
+Manifestation without action is just a nice mood. The action is what actually moves it. What this does is make the action obvious and make you want to do it.
+
+**Your work this week**
+
+Write your specific want. Amount, date, purpose. Then write the one behaviour you'd need to be consistent at. Then do that behaviour this week, once."""),
+
+    ("Visualisation: Who Are You Becoming?", """This is the fun one, and it's more useful than it sounds.
+
+**Meet her**
+
+Picture the version of you who's already there. Two years ahead, financially independent, calm about money.
+
+Get specific. Genuinely specific.
+
+- What does her morning look like? What time does she get up, and why?
+- What is she wearing? Not designer necessarily, but how does she dress for herself?
+- How does she talk about money? Casually? Without apologising?
+- What does she say no to?
+- What's she stopped worrying about entirely?
+- How does she carry herself walking into a room?
+- What does she do when something goes wrong?
+
+Write it out properly. Not bullet points, actual description. The detail is what makes it usable.
+
+**Why this works**
+
+You can't move toward something you can't picture. Vague ambition produces vague action.
+
+Once she's clear, every decision gets a filter: *would she do this?* That's a far better guide than motivation, which comes and goes.
+
+**The bit people skip**
+
+She isn't only richer. She has different habits, different boundaries, different self-talk. The money is downstream of those, not the other way round.
+
+**Your work this week**
+
+Write her out. A full page. Then read it back and underline the three things you could start doing this week."""),
+
+    ("Believe You're Her Before You Become Her", """This is the whole thing, really.
+
+**Embodiment over aspiration**
+
+Aspiration keeps her in the future. "One day I'll be that woman." Which means today you're still the woman who isn't.
+
+Embodiment collapses the gap. You start behaving like her now, in small ways, and the identity catches up.
+
+**What this looks like practically**
+
+Not pretending you have money you don't. That's fantasy and it ends badly.
+
+It's the behaviours:
+
+- She checks her accounts without dread. So you check yours, weekly, even when it's uncomfortable.
+- She doesn't apologise for asking about money. So you ask the question.
+- She takes her own goals seriously. So you put the twenty minutes in your calendar like it's a meeting.
+- She doesn't panic after one bad day. So you follow your rule and stop for the day.
+
+Each one feels small. Each one is you being her, briefly. Do it enough and there's no transition moment, you just are.
+
+**The identity question**
+
+Stop asking "how do I get there?" and ask "what would she do right now?"
+
+Different question, different answer, immediately actionable.
+
+**On the days you don't feel like her**
+
+You won't, often. Do it anyway. Feelings follow action far more reliably than the reverse.
+
+**Your work this week**
+
+Pick one behaviour of hers. Just one. Do it every day this week, especially on the days you don't feel like it. That's the work."""),
+
+    ("Mindset Work That Actually Sticks", """Mindset work fails when it's just positive thinking. Telling yourself you're abundant while avoiding your bank balance doesn't do anything.
+
+**What actually shifts things**
+
+1. **Notice the thought.** "I'm rubbish with money." Catch it in the moment.
+2. **Ask if it's true.** Not "is it nice", is it *true*? Usually it's an old story, not a fact.
+3. **Find the counter-evidence.** You've managed something hard before. Name it.
+4. **Replace with something believable.** Not "I'm amazing with money", your brain will reject that. Try "I'm learning this, and I'm further than I was."
+
+Believable beats impressive. A reframe you don't buy does nothing.
+
+**The daily practice**
+
+Five minutes. Genuinely five.
+
+- One thing that went well, however small.
+- One thought you caught and questioned.
+- One thing you'll do tomorrow.
+
+That's it. Consistency beats intensity here too.
+
+**When it gets hard**
+
+It will. You'll have a losing week and every old belief will show up loudly, saying it was never for you.
+
+That's the moment the work matters. Not when things are going well.
+
+**Your work this week**
+
+Do the five minutes daily. Write it somewhere. At the end of the week read it back, you'll see the pattern in your own thinking, which is the point."""),
+
+    ("Knowing Your Worth", """Most women undercharge, under-ask, and over-explain. Not because we don't know our value, but because we were taught that naming it is arrogant.
+
+**Where this shows up**
+
+- Accepting less than you're worth because asking felt uncomfortable.
+- Explaining a price instead of just saying it.
+- Feeling guilty about money you've earned.
+- Saying "it's only a bit" about something you worked hard for.
+
+**The reframe**
+
+Your worth isn't up for negotiation based on how comfortable other people are with it. Someone else's discomfort with your ambition is not information about whether your ambition is reasonable.
+
+**In trading specifically**
+
+Undervaluing yourself shows up as closing winners early. You take the small profit because part of you doesn't quite believe you're allowed the bigger one. Then you sit and watch it run to where your target was.
+
+That's not a strategy problem. That's a worth problem wearing a strategy costume.
+
+**Your work this week**
+
+Notice one moment where you shrink. A price, a request, a boundary, a target. Just notice it. Then next time, say the thing without the explanation after it."""),
+
+    ("The People Around You", """Not everyone will be pleased for you. That's worth preparing for.
+
+**What tends to happen**
+
+When you start changing, people who knew the old version get uncomfortable. Not because they're bad people, usually because your growth quietly asks a question of their own choices.
+
+You'll hear things like: "Isn't that risky?" "Must be nice." "Don't get carried away." Often from people who love you.
+
+**How to handle it**
+
+- **You don't owe everyone the details.** Sharing less isn't dishonesty, it's boundaries.
+- **Distinguish concern from projection.** Concern asks questions. Projection makes statements about what you can't do.
+- **Find people who are doing it.** That's what the group is for. It's much harder to believe something's impossible when you're watching women do it weekly.
+
+**On partners and family**
+
+Money is loaded in relationships. If you're building something and it's causing friction, that friction is usually about something older than money.
+
+You're still allowed to build it.
+
+**Your work this week**
+
+Name one person who genuinely supports this, and one whose opinion you've been over-weighting. Adjust accordingly."""),
+
+    ("Habits That Build Her", """Motivation is unreliable. Habits are what actually carry you.
+
+**Why this matters more than it sounds**
+
+Every woman who's built financial independence did it in ordinary weeks. Not dramatic ones. Ordinary Tuesdays where she did the small thing again.
+
+**The four that matter here**
+
+1. **Check in with your money weekly.** Same day, ten minutes. Accounts, positions, where you are. Familiarity kills the dread.
+2. **Learn in small doses.** One lesson, twenty minutes. Not four hours on a Sunday you'll never repeat.
+3. **Review your trades.** What you did, why, what happened. This is where actual improvement comes from.
+4. **Protect one thing daily.** A walk, a page, five quiet minutes. You cannot build from empty.
+
+**Making them stick**
+
+- Attach it to something you already do. After the school run. With your morning coffee.
+- Make it embarrassingly small to start. Five minutes counts.
+- Miss one day, fine. Never miss two.
+
+**Your work this week**
+
+Pick one. Just one. Attach it to something existing and do it for seven days."""),
+
+    ("Goal Setting That Actually Works", """Most goals fail because they're wishes with a deadline attached.
+
+**The problem with "I want to make £1,000 a month"**
+
+It's an outcome, and outcomes aren't fully in your control. The market does what it does. Chasing an outcome you can't control leads to forcing trades, which loses money.
+
+**Set process goals instead**
+
+- "I'll follow my risk rules on every trade this month."
+- "I'll complete one lesson a week."
+- "I'll journal every trade."
+
+You control all of those completely. And they're the things that actually produce the outcome.
+
+**The structure**
+
+1. **One year:** where do you want to be? Keep it honest, not fantasy.
+2. **Ninety days:** what needs to be true by then?
+3. **This week:** what's the one thing?
+
+Most people set the year and skip the week. The week is the only part that does anything.
+
+**Reviewing without self-flagellation**
+
+Monthly, ask three questions: what worked, what didn't, what am I changing? That's it. No moral judgement, you're gathering data, not building a case against yourself.
+
+**Your work this week**
+
+Write your one-year, ninety-day and this-week. One line each. Put the weekly one somewhere you'll see it."""),
+
+    ("Money Stories & Where They Came From", """Every one of us is running money software we didn't write.
+
+Maybe you watched a parent stress about bills. Maybe money was never discussed at all. Maybe you were praised for being the one who never asked for anything.
+
+None of that was your choice. All of it is still shaping how you handle money now.
+
+**Common ones worth spotting**
+
+*"It's selfish to want more."* Usually learned from someone who never got to want more themselves.
+
+*"I'm rubbish with numbers."* Usually said once, by someone else, and then carried for twenty years.
+
+*"Someone else deals with that."* Often true, and often the reason women end up financially exposed when circumstances change.
+
+*"I'll sort it when things settle down."* Things don't settle down. That's the whole point.
+
+**Why this matters for trading**
+
+Your money story shows up in your trades. Fear of taking up space becomes closing winners too early. Feeling undeserving becomes self-sabotage after a good run. Scarcity becomes over-leveraging to catch up.
+
+You can learn every technical skill going, and old beliefs will still override them under pressure.
+
+**Your work this week**
+
+Name one money belief you inherited. Write where it came from. Then write what you'd rather believe instead."""),
+
+    ("Building Financial Independence", """Independence isn't a number in an account. It's the number of choices available to you.
+
+**What it actually looks like**
+
+- Being able to leave a job, a relationship, a situation, without financial panic making the decision for you.
+- Saying no without calculating the cost.
+- Helping someone you love without checking your balance first.
+- Not needing to explain your spending to anyone.
+
+That's the real goal. Wealth is just the mechanism.
+
+**The layers, in order**
+
+1. **A buffer.** Even a small one. Three hundred pounds you don't touch changes how you sleep.
+2. **Cover.** Enough to handle a few months if something goes wrong. This is the layer that buys you the ability to walk away.
+3. **Growth.** Money that works while you're doing other things. This is where trading and investing sit.
+4. **Freedom.** Enough that work becomes a choice.
+
+Most people try to skip to layer three or four. That's usually why it falls apart, no buffer means one bad month wipes out months of progress.
+
+**Where trading fits**
+
+Trading is a growth tool. It's a bad emergency fund and a worse rescue plan. Money you need next month has no business in the market.
+
+**Your work this week**
+
+Identify which layer you're genuinely on. Not where you'd like to be. Then name the single next step, not the whole ladder."""),
+
+    ("Confidence That Doesn't Need Permission", """Confidence isn't a feeling you wait for. It's the evidence you build.
+
+**The trap**
+
+We tell ourselves we'll feel ready once we know enough. So we read more, watch more, prepare more, and never start. Preparation becomes a very respectable form of hiding.
+
+The knowing comes from doing. Always has.
+
+**Competence stacking**
+
+Every small completed thing is evidence. You placed a trade. You closed it properly. You stuck to your stop loss when everything in you wanted to move it.
+
+None of those feel like much alone. Stack thirty of them and you're a different person, because now you have proof rather than hope.
+
+**On being the only woman in the room**
+
+You may often be. Trading spaces are loud and male-dominated by default, which is exactly why Wealth Circle exists.
+
+You don't need to be louder to belong. Competence is quieter than confidence and lasts considerably longer.
+
+**Your work this week**
+
+Write down three things you can do now that you couldn't six months ago. Anything. Read them back when you're doubting yourself."""),
+
+    ("Handling Fear, Loss & Getting Back Up", """You will lose money. Not might. Will.
+
+Anyone who tells you otherwise is either selling something or hasn't been at this long enough.
+
+**Why losses hurt more than they should**
+
+A £20 loss rarely feels like £20. It feels like proof, that you're not good at this, that you shouldn't have tried, that everyone else has it figured out.
+
+That's not the loss talking. That's the money story from masterclass two.
+
+**Separating the outcome from the decision**
+
+A good decision can produce a bad outcome. You can follow your plan exactly and still lose. That's not failure, that's probability.
+
+The only real question after a loss: did I follow my process? If yes, it was a good trade with a bad outcome. If no, that's the thing to fix, not the market.
+
+**The spiral, and how to stop it**
+
+Loss, then panic, then a bigger trade to win it back, then a bigger loss. This is where accounts die. Not from one bad trade, from the reaction to it.
+
+The circuit breaker is boring and it works: stop for the day. Not forever, just today.
+
+**Your work this week**
+
+Decide your rule now, while you're calm. Mine might be: two losses in a day and I'm done until tomorrow. Write yours down before you need it."""),
+
+    ("Your Wealth Plan", """Everything so far comes together here.
+
+**Three questions**
+
+1. **What is this actually for?** Not "more money". What does it buy you? Options? Time? Security? Get specific, vague goals don't survive difficult weeks.
+2. **What can you genuinely commit?** Money and time, honestly. Twenty minutes a day you'll actually do beats two hours you won't.
+3. **What's your line?** The amount you won't go past, the risk you won't take, the rule you won't break.
+
+**Building it**
+
+- **Capital:** what you're starting with, and what you'd add monthly if anything.
+- **Risk:** your lot size per trade based on your balance, not on how confident you feel.
+- **Learning:** which course, how often, when.
+- **Review:** a set day each month to look at what actually happened.
+- **Boundaries:** your stop-for-the-day rule, and what you won't do even when tempted.
+
+**On patience**
+
+This is slower than social media suggests. Compounding is unglamorous for a long time and then suddenly isn't. The women who get there are rarely the cleverest, they're the ones still going in year three.
+
+**Your work this week**
+
+Write your plan. One page, plain language, no jargon. Something you could hand to a friend and have her understand it.
+
+Then come share it in the group. That's what it's there for."""),
+]
+
+
+HER_CATEGORIES = [
+    ("Becoming Her",
+     "Belief, identity and stepping into the woman you're building toward.",
+     ["Becoming HER: The Foundation",
+      "Becoming HER: Believing You're Capable",
+      "Believe You're Her Before You Become Her",
+      "Visualisation: Who Are You Becoming?"]),
+    ("Manifesting & Goal Setting",
+     "Getting specific about what you want, then building the path to it.",
+     ["Manifestation, Done Properly",
+      "Goal Setting That Actually Works",
+      "Habits That Build Her"]),
+    ("Money Mindset",
+     "The stories underneath how you handle money, and how to rewrite them.",
+     ["Money Stories & Where They Came From",
+      "Mindset Work That Actually Sticks",
+      "Knowing Your Worth"]),
+    ("Independence & Wealth",
+     "The practical side of building something that's genuinely yours.",
+     ["Building Financial Independence",
+      "Your Wealth Plan"]),
+    ("Confidence & Resilience",
+     "Holding your nerve, handling setbacks, and the people around you.",
+     ["Confidence That Doesn't Need Permission",
+      "Handling Fear, Loss & Getting Back Up",
+      "The People Around You"]),
+]
+
+HER_LESSONS = [
+    ("Money Mindset", """Most of us grew up absorbing messages about money that were never really ours. That it's rude to talk about, that wanting more is greedy, that someone else handles it.
+
+None of that is true, and none of it has to stay.
+
+Building wealth starts with giving yourself permission to want it. Not apologising for it, not shrinking it down to something more palatable. Just wanting it, plainly.
+
+**Something to sit with this week:** what's one belief about money you picked up from someone else that you've never actually questioned?"""),
+
+    ("Confidence Is Built, Not Born", """Nobody starts confident. That's the bit nobody tells you.
+
+Confidence isn't something you wait to feel before you act. It's the thing that shows up afterwards, once you've done the hard thing badly a few times and survived it.
+
+Your first trades will feel uncomfortable. Your first loss will sting more than the numbers justify. That's not a sign you're not cut out for this, it's just what the beginning feels like for everyone.
+
+**Something to sit with:** where in your life have you already done this? Started something scary, been rubbish at it, and got good anyway?"""),
+
+    ("Handling a Loss Without Spiralling", """A losing trade is information. It isn't a verdict on you.
+
+The danger isn't the loss itself, it's the story we attach to it. "I'm bad at this." "I should have known." "Everyone else is doing better."
+
+None of that is analysis. It's just noise, and it's the thing that leads to revenge trading and blown accounts.
+
+The traders who last are the ones who can look at a loss, note what happened, and move on without making it mean something about their worth.
+
+**Something to sit with:** what do you normally say to yourself after something goes wrong? Would you say it to a friend?"""),
+
+    ("Comparison Is a Thief", """Someone in the group will post a bigger win than yours. Someone will seem to pick it up faster.
+
+You have no idea what account size they're working with, how long they've been at it, or what they're not posting.
+
+Your only real competition is who you were three months ago. That's the only comparison that tells you anything useful.
+
+**Something to sit with:** what's one thing you understand now that you didn't at the start?"""),
+
+    ("Consistency Over Intensity", """Big bursts of effort feel productive. They rarely are.
+
+Someone who studies twenty minutes a day for a year will end up further ahead than someone who binges for a weekend and then disappears for a month.
+
+The same is true of trading. Small, boring, repeatable beats dramatic every time.
+
+**Something to sit with:** what's the smallest version of showing up that you could genuinely do every day?"""),
+
+    ("Boundaries Around Your Money", """Building wealth is as much about what you protect as what you earn.
+
+That includes protecting your capital with proper risk management. It also includes protecting your time, your headspace, and your energy from people who drain it.
+
+You're allowed to keep your finances private. You're allowed to say no. You're allowed to prioritise your own growth without justifying it.
+
+**Something to sit with:** where do you need a firmer boundary right now?"""),
+
+    ("Independence Is the Real Goal", """Money isn't the point. Options are.
+
+The ability to leave a situation that isn't working. To say no. To take a risk without it being catastrophic. To help someone you love without checking your balance first.
+
+That's what this is actually about. Keep that in view when the day to day feels slow.
+
+**Something to sit with:** what would having genuine options change for you?"""),
+]
+
+HER_QUOTES = [
+    ("What you're not changing, you're choosing.", ""),
+    ("She remembered who she was and the game changed.", "Lalah Delia"),
+    ("A woman with a voice is, by definition, a strong woman.", "Melinda Gates"),
+    ("Doubt kills more dreams than failure ever will.", "Suzy Kassem"),
+    ("You do not need permission to take up space.", ""),
+    ("The question isn't who is going to let me, it's who is going to stop me.", "Ayn Rand"),
+    ("Small steps, taken consistently, beat big steps taken once.", ""),
+    ("You didn't come this far to only come this far.", ""),
+]
+
+
+@app.route("/her")
+def her():
+    if not is_community():
+        return redirect(url_for("community"))
+
+    quotes_preview = "".join(
+        f'<div class="her-quote"><p>"{q}"</p>{f"<cite>{a}</cite>" if a else ""}</div>'
+        for q, a in HER_QUOTES[:5])
+
+    content = f"""
+<section class="her-hero">
+  <div class="wrap" style="max-width:760px; text-align:center;">
+    <div class="her-mark">FEMALE<br>WEALTH</div>
+    <span class="eyebrow" style="color:var(--rose);">Members only</span>
+    <h1 style="margin:16px 0 18px; font-size:48px;">Welcome to <em style="color:var(--rose);">Female Wealth.</em></h1>
+    <p class="lede" style="max-width:580px; margin:0 auto;">Your private space. Masterclasses on becoming her, mindset work, and a circle of women building exactly what you're building.</p>
+  </div>
+</section>
+
+<section style="padding-top:60px;">
+  <div class="wrap" style="max-width:680px;">
+    <div class="her-panel" style="margin-bottom:16px;">
+      <span class="eyebrow" style="color:var(--rose);">Your group</span>
+      <h3 style="font-size:22px; margin:8px 0 10px;">The community on Telegram</h3>
+      <p style="color:var(--ink-dim); font-size:14px; margin:0 0 20px;">Saved here so you never lose it. This is where the day to day happens.</p>
+      <a href="https://t.me/+TWaAqQlTTuU1OGU0" target="_blank" rel="noopener" class="btn btn-primary" style="width:100%; text-align:center;">Open the group</a>
+    </div>
+
+    <a href="/her/masterclasses" class="her-card">
+      <span class="her-num">01</span>
+      <span class="her-title">Masterclasses to become her<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">{len(HER_MASTERCLASSES)} sessions across 5 areas</span></span>
+      <span class="her-arrow">→</span>
+    </a>
+
+    <a href="/her/mindset" class="her-card">
+      <span class="her-num">02</span>
+      <span class="her-title">Mindset &amp; growth<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">{len(HER_LESSONS)} short reads for when you need a reset</span></span>
+      <span class="her-arrow">→</span>
+    </a>
+  </div>
+</section>
+
+<section style="padding-top:20px;">
+  <div class="wrap" style="max-width:860px;">
+    <div class="section-head" style="max-width:100%; text-align:center; margin-bottom:26px;">
+      <span class="eyebrow" style="color:var(--rose);">For the harder days</span>
+      <h2 style="font-size:28px;">Words to come back to</h2>
+    </div>
+    <div class="her-quotes">{quotes_preview}</div>
+    <div style="text-align:center; margin-top:26px;">
+      <a href="/her/words" class="inline-link" style="color:var(--rose);">See them all →</a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="max-width:680px;">
+    <a href="/her/share" class="her-card">
+      <span class="her-num">03</span>
+      <span class="her-title">Share &amp; support<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">Share your results or get help any time</span></span>
+      <span class="her-arrow">→</span>
+    </a>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Female Wealth", content, "community"))
+
+
+@app.route("/her/masterclasses")
+def her_masterclasses():
+    if not is_community():
+        return redirect(url_for("community"))
+
+    title_to_idx = {t: i for i, (t, _) in enumerate(HER_MASTERCLASSES)}
+    blocks = []
+    for cat_name, cat_desc, titles in HER_CATEGORIES:
+        items = "".join(
+            f'<a href="/her/masterclass/{title_to_idx[t]}" class="her-card small">'
+            f'<span class="her-title">{t}</span><span class="her-arrow">→</span></a>'
+            for t in titles if t in title_to_idx)
+        blocks.append(
+            f'<div style="margin-bottom:44px;">'
+            f'<h2 style="font-family:\'Fraunces\',serif; font-size:24px; margin:0 0 6px; color:var(--rose);">{cat_name}</h2>'
+            f'<p style="color:var(--ink-dim); font-size:14px; margin:0 0 18px;">{cat_desc}</p>'
+            f'{items}</div>')
+
+    content = f"""
+<section style="padding:60px 0 40px;">
+  <div class="wrap" style="max-width:680px;">
+    <a href="/community" class="inline-link" style="font-size:13px; color:var(--rose);">← Back to Female Wealth</a>
+    <div class="section-head" style="max-width:100%; margin:24px 0 40px;">
+      <span class="eyebrow" style="color:var(--rose);">Members only</span>
+      <h1 style="font-size:34px; margin:10px 0 12px;">Masterclasses to become her</h1>
+      <p>{len(HER_MASTERCLASSES)} sessions on independence, stepping into your best self, and building real confidence with money.</p>
+    </div>
+    {"".join(blocks)}
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Masterclasses", content, "community"))
+
+
+@app.route("/her/mindset")
+def her_mindset():
+    if not is_community():
+        return redirect(url_for("community"))
+    items = "".join(
+        f'<a href="/her/lesson/{i}" class="her-card small"><span class="her-num">{i+1:02d}</span>'
+        f'<span class="her-title">{t}</span><span class="her-arrow">→</span></a>'
+        for i, (t, _) in enumerate(HER_LESSONS))
+    content = f"""
+<section style="padding:60px 0 40px;">
+  <div class="wrap" style="max-width:680px;">
+    <a href="/community" class="inline-link" style="font-size:13px; color:var(--rose);">← Back to Female Wealth</a>
+    <div class="section-head" style="max-width:100%; margin:24px 0 34px;">
+      <span class="eyebrow" style="color:var(--rose);">Short reads</span>
+      <h1 style="font-size:34px; margin:10px 0 12px;">Mindset &amp; growth</h1>
+      <p>Quick lessons for when you need a reset.</p>
+    </div>
+    {items}
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Mindset", content, "community"))
+
+
+@app.route("/her/words")
+def her_words():
+    if not is_community():
+        return redirect(url_for("community"))
+    quotes = "".join(
+        f'<div class="her-quote"><p>"{q}"</p>{f"<cite>{a}</cite>" if a else ""}</div>'
+        for q, a in HER_QUOTES)
+    content = f"""
+<section style="padding:60px 0 40px;">
+  <div class="wrap" style="max-width:860px;">
+    <a href="/community" class="inline-link" style="font-size:13px; color:var(--rose);">← Back to Female Wealth</a>
+    <div class="section-head" style="max-width:100%; margin:24px 0 34px; text-align:center;">
+      <span class="eyebrow" style="color:var(--rose);">For the harder days</span>
+      <h1 style="font-size:34px; margin:10px 0 12px;">Words to come back to</h1>
+    </div>
+    <div class="her-quotes">{quotes}</div>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Words", content, "community"))
+
+
+@app.route("/her/share")
+def her_share():
+    if not is_community():
+        return redirect(url_for("community"))
     content = """
-<section class="hero" style="padding-bottom: 40px;">
-  <div class="wrap" style="grid-template-columns: 1fr;">
-    <div>
-      <span class="eyebrow" style="color: var(--rose);">Wealth Circle</span>
-      <h1>A trading space<br>built for <em style="color: var(--rose);">women.</em></h1>
-      <p class="lede">Trading communities default to loud and male-dominated. This one doesn't. It's private, supportive, and genuinely welcoming, whatever stage you're at.</p>
-      <div class="cta-row">
-        <a href="/onboarding" class="btn btn-primary">Start Onboarding</a>
+<section style="padding:60px 0 40px;">
+  <div class="wrap" style="max-width:680px;">
+    <a href="/community" class="inline-link" style="font-size:13px; color:var(--rose);">← Back to Female Wealth</a>
+    <div class="section-head" style="max-width:100%; margin:24px 0 34px; text-align:center;">
+      <span class="eyebrow" style="color:var(--rose);">Share &amp; support</span>
+      <h1 style="font-size:34px; margin:10px 0 12px;">How are you getting on?</h1>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:18px;">
+      <div class="her-panel" style="text-align:center;">
+        <div class="her-icon">★</div>
+        <h3 style="font-size:17px; margin-bottom:8px;">Share your results</h3>
+        <p style="color:var(--ink-dim); font-size:14px;">Message "share results" to our bot and send your screenshots. Wins, lessons, progress, all welcome.</p>
+        <a href="https://t.me/Innercircleverifybot" target="_blank" rel="noopener" class="inline-link" style="font-size:13px;">Share now →</a>
+      </div>
+      <div class="her-panel" style="text-align:center;">
+        <div class="her-icon">♥</div>
+        <h3 style="font-size:17px; margin-bottom:8px;">Need support?</h3>
+        <p style="color:var(--ink-dim); font-size:14px;">Message us privately any time. No question is too small in here, genuinely.</p>
+        <a href="/messages" class="inline-link" style="font-size:13px;">Message us →</a>
       </div>
     </div>
   </div>
 </section>
+"""
+    return render_template_string(base_layout("Share & Support", content, "community"))
 
-<section>
-  <div class="wrap">
-    <div class="grid5" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));">
-      <div class="benefit"><div class="icon" style="border-color: var(--rose); color: var(--rose);">○</div><h3>Ask anything</h3><p>No question is too basic. Ever.</p></div>
-      <div class="benefit"><div class="icon" style="border-color: var(--rose); color: var(--rose);">♥</div><h3>Share wins</h3><p>Celebrate progress, big or small.</p></div>
-      <div class="benefit"><div class="icon" style="border-color: var(--rose); color: var(--rose);">◈</div><h3>Weekly threads</h3><p>Regular check-ins and discussion.</p></div>
-      <div class="benefit"><div class="icon" style="border-color: var(--rose); color: var(--rose);">★</div><h3>Direct access</h3><p>To Charlotte and the team.</p></div>
+
+@app.route("/her/masterclass/<int:idx>")
+def her_masterclass(idx):
+    if not is_community():
+        return locked_page("HER is our private space for Wealth Circle members.", "Request to Join", "/community")
+    idx = max(0, min(idx, len(HER_MASTERCLASSES) - 1))
+    title, body = HER_MASTERCLASSES[idx]
+    body_html = md_lib.markdown(body)
+    prev_html = f'<a href="/her/masterclass/{idx-1}" class="btn btn-ghost">← Back</a>' if idx > 0 else '<span></span>'
+    next_html = (f'<a href="/her/masterclass/{idx+1}" class="btn btn-primary">Next →</a>'
+                 if idx < len(HER_MASTERCLASSES) - 1 else '<a href="/her" class="btn btn-primary">Finish</a>')
+    content = f"""
+<section style="padding:60px 0;">
+  <div class="wrap" style="max-width:660px;">
+    <a href="/her" class="inline-link" style="font-size:13px; color:var(--rose);">← Back to HER</a>
+    <div style="height:4px; background:var(--line); border-radius:4px; margin:24px 0 8px; overflow:hidden;">
+      <div style="height:100%; width:{round(((idx+1)/len(HER_MASTERCLASSES))*100)}%; background:var(--rose); border-radius:4px;"></div>
     </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap" style="text-align: center; max-width: 600px;">
-    <h2 style="font-size: 30px; margin-bottom: 20px;">Community access opens on request</h2>
-    <p style="color: var(--ink-dim); margin-bottom: 32px;">Complete onboarding first, then request to join, we'll add you to the private Wealth Circle group on Telegram.</p>
-    <div style="display: flex; gap: 16px; justify-content: center; flex-wrap: wrap;">
-      <a href="/onboarding" class="btn btn-ghost">Start Onboarding</a>
-      <a href="https://t.me/Innercircleverifybot" class="btn btn-primary" target="_blank" rel="noopener">Request to Join on Telegram</a>
+    <p style="font-size:12px; color:var(--ink-dim); margin:0;">Masterclass {idx+1} of {len(HER_MASTERCLASSES)}</p>
+    <h1 style="font-size:34px; margin:22px 0 28px;">{title}</h1>
+    <div class="course-content" style="max-width:100%;">{body_html}</div>
+    <div style="display:flex; justify-content:space-between; margin-top:50px; padding-top:30px; border-top:1px solid var(--line);">
+      {prev_html}{next_html}
     </div>
   </div>
 </section>
 """
-    return render_template_string(base_layout("Community", content, "community"))
+    return render_template_string(base_layout(title, content, "community"))
+
+
+@app.route("/her/lesson/<int:idx>")
+def her_lesson(idx):
+    if not is_community():
+        return locked_page(
+            "HER is our private space for Wealth Circle members.",
+            "Request to Join", "/community"
+        )
+    idx = max(0, min(idx, len(HER_LESSONS) - 1))
+    title, body = HER_LESSONS[idx]
+    body_html = md_lib.markdown(body)
+
+    prev_html = f'<a href="/her/lesson/{idx-1}" class="btn btn-ghost">← Back</a>' if idx > 0 else '<span></span>'
+    next_html = (f'<a href="/her/lesson/{idx+1}" class="btn btn-primary">Next →</a>'
+                 if idx < len(HER_LESSONS) - 1
+                 else '<a href="/her" class="btn btn-primary">Finish</a>')
+
+    content = f"""
+<section style="padding:60px 0;">
+  <div class="wrap" style="max-width:680px;">
+    <a href="/her" class="inline-link" style="font-size:13px;">← Back to HER</a>
+    <div style="height:4px; background:var(--line); border-radius:4px; margin:24px 0 8px; overflow:hidden;">
+      <div style="height:100%; width:{round(((idx+1)/len(HER_LESSONS))*100)}%; background:var(--rose); border-radius:4px;"></div>
+    </div>
+    <p style="font-size:12px; color:var(--ink-dim); margin:0;">Lesson {idx+1} of {len(HER_LESSONS)}</p>
+    <h1 style="font-size:30px; margin:22px 0 26px;">{title}</h1>
+    <div class="course-content" style="max-width:100%;">{body_html}</div>
+    <div style="display:flex; justify-content:space-between; margin-top:50px; padding-top:30px; border-top:1px solid var(--line);">
+      {prev_html}{next_html}
+    </div>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout(title, content, "community"))
+
+
+@app.route("/community")
+def community():
+    if is_community():
+        return her()
+    content = """
+<section class="her-hero">
+  <div class="wrap" style="max-width:760px; text-align:center;">
+    <div class="her-mark">FEMALE<br>WEALTH</div>
+    <span class="eyebrow" style="color:var(--rose);">Women only</span>
+    <h1 style="margin:16px 0 18px; font-size:46px;">A space built for <em style="color:var(--rose);">her.</em></h1>
+    <p class="lede" style="max-width:600px; margin:0 auto 34px;">Trading spaces are loud and male-dominated by default. This one isn't. Female Wealth is our private community for women, plus a members-only library you won't find anywhere else on the site.</p>
+    <a href="#request" class="btn btn-primary">Request Access</a>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="max-width:720px;">
+    <div class="section-head" style="max-width:100%; text-align:center; margin-bottom:34px;">
+      <span class="eyebrow" style="color:var(--rose);">What's inside</span>
+      <h2 style="font-size:32px;">Once you're in</h2>
+      <p>Here's what unlocks the moment your request is approved.</p>
+    </div>
+
+    <div class="her-card" style="cursor:default;">
+      <span class="her-num">01</span>
+      <span class="her-title">The private community<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">A women-only group to ask anything, share wins, and grow together</span></span>
+      <span class="her-arrow">🔒</span>
+    </div>
+
+    <div class="her-card" style="cursor:default;">
+      <span class="her-num">02</span>
+      <span class="her-title">Masterclasses to become her<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">15 members-only sessions across 5 areas, not available anywhere else</span></span>
+      <span class="her-arrow">🔒</span>
+    </div>
+
+    <div class="her-card" style="cursor:default;">
+      <span class="her-num">03</span>
+      <span class="her-title">Mindset &amp; growth library<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">Short reads for the days you need a reset</span></span>
+      <span class="her-arrow">🔒</span>
+    </div>
+
+    <div class="her-card" style="cursor:default;">
+      <span class="her-num">04</span>
+      <span class="her-title">Share &amp; support<br><span style="font-family:'Inter'; font-size:13px; color:var(--ink-dim);">Share your results and get help privately, any time</span></span>
+      <span class="her-arrow">🔒</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="max-width:720px;">
+    <div class="section-head" style="max-width:100%; text-align:center; margin-bottom:30px;">
+      <span class="eyebrow" style="color:var(--rose);">The masterclasses cover</span>
+      <h2 style="font-size:30px;">Five areas, built around you</h2>
+    </div>
+    <div class="her-quotes">
+      <div class="her-quote"><p style="font-size:16px;">Becoming Her</p><cite>Belief, identity and stepping into who you're building toward</cite></div>
+      <div class="her-quote"><p style="font-size:16px;">Manifesting &amp; Goal Setting</p><cite>Getting specific about what you want, then building the path</cite></div>
+      <div class="her-quote"><p style="font-size:16px;">Money Mindset</p><cite>The stories underneath how you handle money</cite></div>
+      <div class="her-quote"><p style="font-size:16px;">Independence &amp; Wealth</p><cite>Building something that's genuinely yours</cite></div>
+      <div class="her-quote"><p style="font-size:16px;">Confidence &amp; Resilience</p><cite>Holding your nerve, and the people around you</cite></div>
+    </div>
+  </div>
+</section>
+
+<section id="request">
+  <div class="wrap" style="max-width:560px;">
+    <div class="section-head" style="max-width:100%; text-align:center; margin-bottom:30px;">
+      <span class="eyebrow" style="color:var(--rose);">Join us</span>
+      <h2 style="font-size:30px;">Request your access</h2>
+      <p>Complete onboarding first, then request below. We review every request personally.</p>
+    </div>
+    <div class="her-panel">
+      <form method="POST" action="/community/request">
+        <label>Title</label>
+        <select name="title" required style="width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--ink); padding: 13px 16px; border-radius: 10px; font-family: 'Inter'; font-size: 15px;">
+          <option value="">Select</option>
+          <option>Mrs</option>
+          <option>Miss</option>
+          <option>Ms</option>
+        </select>
+        <label>Full name</label>
+        <input type="text" name="name" required>
+        <label>Your Telegram username</label>
+        <input type="text" name="telegram_username" placeholder="@yourusername" required>
+        <label>Anything you'd like us to know? (optional)</label>
+        <input type="text" name="note" placeholder="Optional">
+        <button type="submit">Request Access</button>
+      </form>
+      <p style="color: var(--ink-dim); font-size: 13px; margin-top: 18px;">
+        Female Wealth is a women-only space. Everything else on Inner Circle, signals, education and support, is open to everyone.
+      </p>
+    </div>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Female Wealth", content, "community"))
+
+
+@app.route("/community/request", methods=["POST"])
+def community_request():
+    title = request.form.get("title", "")
+    name = request.form.get("name", "")
+    tg = request.form.get("telegram_username", "")
+    note = request.form.get("note", "")
+
+    member_id = create_pending_member(
+        tier="community", title=title, name=name, account_number="",
+        deposit_amount="", phone="", telegram_username=tg, referred_by=note
+    )
+    notify_admin(
+        f"👭 WEALTH CIRCLE REQUEST\n\n"
+        f"Title: {title}\nName: {name}\nTelegram: {tg}\n"
+        f"Note: {note or '(none)'}\nMember ID: {member_id}\n\n"
+        f"Review and approve at https://innercircletrading.co/admin"
+    )
+
+    content = """
+<section>
+  <div class="wrap" style="max-width: 620px; text-align: center; padding: 70px 0;">
+    <span class="eyebrow" style="color: var(--rose);">Request sent</span>
+    <h1 style="font-size: 32px; margin: 12px 0 18px;">We've got your request.</h1>
+    <p style="color: var(--ink-dim); font-size: 16px;">We review each one personally. You'll get your Wealth Circle invite on Telegram once approved, usually within 24 hours.</p>
+    <a href="/" class="btn btn-primary" style="margin-top: 30px;">Back to Home</a>
+  </div>
+</section>
+"""
+    return render_template_string(base_layout("Request Sent", content, "community"))
 
 
 if __name__ == "__main__":
